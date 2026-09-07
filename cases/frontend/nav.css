@@ -1,0 +1,5 @@
+.nav { display:flex; gap:12px; align-items:center; }
+
+@media (max-width: 640px) {
+  .nav { flex-direction: column; }
+}

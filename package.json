@@ -2,6 +2,7 @@
   "name": "pi-friends",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Personal Pi teammates: names, async progress, steering and shared file coordination",
   "pi": { "extensions": ["./index.ts"] },

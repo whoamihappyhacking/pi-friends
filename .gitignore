@@ -3,3 +3,6 @@ reports/
 *-report.json
 .DS_Store
 *.log
+
+# 本机使用笔记，不进仓库
+使用约定-本机.md

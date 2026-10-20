@@ -12,7 +12,7 @@ let packageDir=path.dirname(cli);
 while(!fs.existsSync(path.join(packageDir,'dist/core/extensions/loader.js'))){const parent=path.dirname(packageDir);if(parent===packageDir)throw Error('Pi extension loader not found');packageDir=parent;}
 const {loadExtensions,clearExtensionCache}=await import(pathToFileURL(path.join(packageDir,'dist/core/extensions/loader.js')).href);
 const dir=fs.mkdtempSync(path.join(os.tmpdir(),'pi-friends-reload-'));
-const prior=process.env.PI_FRIENDS_HOME;process.env.PI_FRIENDS_HOME=path.join(dir,'state');
+const prior=process.env.PI_FRIENDS_HOME,priorChild=process.env.PI_FRIENDS_CHILD;delete process.env.PI_FRIENDS_CHILD;process.env.PI_FRIENDS_HOME=path.join(dir,'state');
 let extension;
 try{
   const entry=path.join(dir,'index.ts');
@@ -23,7 +23,7 @@ try{
   fs.writeFileSync(path.join(dir,'runtime.mjs'),'export class Team {depart(){}}');
   clearExtensionCache();loaded=await loadExtensions([entry],dir);
   assert.equal(await loaded.extensions[0].commands.get('probe').handler(),'undefined','reproduces stale native module');
-  for(const name of ['index.ts','runtime.ts','store.ts','rpc.ts','model-config.ts','notices.ts','worker.ts'])fs.copyFileSync(path.join(source,name),path.join(dir,name));
+  for(const name of ['index.ts','runtime.ts','store.ts','rpc.ts','model-config.ts','notices.ts','worker.ts','command.ts','identity.ts','panel.ts'])fs.copyFileSync(path.join(source,name),path.join(dir,name));
   const key='reload-test',state=path.join(process.env.PI_FRIENDS_HOME,'teams',hash(key).slice(0,24),'team.json');
   atomicJSON(state,{version:1,agents:['menu','tool','reject'].map(id=>({id,name:id,task:'fixture',status:'done',summary:'completed',lastAnswer:'retained result',messages:[],results:[],usage:{},revision:1,notifiedRevision:1,lastProgress:Date.now()}))});
   clearExtensionCache();loaded=await loadExtensions([entry],dir);assert.deepEqual(loaded.errors,[]);extension=loaded.extensions[0];
@@ -41,7 +41,7 @@ try{
     const result=await execute('call',{action,id,reason:'fixture validation'},undefined,()=>{},ctx);
     assert.ok(!result.isError,JSON.stringify(result));assert.equal(result.details.status,'departed');
   }
-  assert.ok(widgets.at(-1).every(line=>!line.startsWith('menu ·')&&!line.startsWith('tool ·')));
+  assert.equal(widgets.at(-1),undefined);
   assert.equal(notifications.length,1);
   const sourceText=fs.readFileSync(path.join(source,'index.ts'),'utf8');
   assert.ok(!sourceText.includes('display:true'));assert.ok(!sourceText.includes('| 小伙伴 |'));
@@ -51,6 +51,7 @@ try{
   console.log('PASS: stale .mjs reproduced; same-process upgrade; /f dismiss; tool accept/reject; widget removal');
 }finally{
   for(const fn of extension?.handlers.get('session_shutdown')||[])await fn({});
+  if(priorChild===undefined)delete process.env.PI_FRIENDS_CHILD;else process.env.PI_FRIENDS_CHILD=priorChild;
   if(prior===undefined)delete process.env.PI_FRIENDS_HOME;else process.env.PI_FRIENDS_HOME=prior;
   fs.rmSync(dir,{recursive:true,force:true});
 }

@@ -1,5 +1,98 @@
 # Pi Friends 0.1.0 验收记录
 
+## 工具失败只记录、对外显示名统一（本轮）
+
+仅修改本插件目录与 `/tmp` 测试产物；没有重启或重载当前会话，没有接触微服，也没有修改用户个人配置。
+
+- 删除 `Team` 构造参数/成员属性中的 `maxToolFailures` 和 `tool_execution_end` 中达到阈值调用 `fail()` 的分支；旧配置值被忽略，没有替代上限。保留普通错误连续计数、成功归零、最近工具结果、模型错误以及独立的超时/被杀计数。
+- spawn 和历史记录加载补齐 `displayName`；所有成员工具返回都能取到它，默认文本以面板头像姓氏称呼。完整 `name` 保留在 details、history/指定成员查询及 `/f` 详情。send 同时返回成员 `agentId`，其 `id` 仍是消息回执 ID。完成与 checkDue 提醒、菜单、工具调用提示和拒停错误使用显示名；checkDue 同时附带 failures / lastToolOutcome。
+- 注入规则与工具指南明确：工具失败不会自动停止任务，由主 Agent 依 list 中的 failures / lastToolOutcome 判断；向用户称呼使用 displayName。长活二次验证、普通完成、模型报错与子进程异常退出沿用原流程。
+
+后台执行 `npm run check && npm test`，真实日志：`/tmp/pi-friends-failure-name-validation.log`。
+
+```text
+PASS TypeScript compilation: 10 source files (esbuild); static type checking is not configured in this project
+✔ short: 60 consecutive tool failures keep running (default config), observable and persisted
+✔ short: 60 consecutive tool failures keep running (legacy maxToolFailures=3), observable and persisted
+✔ long: 60 consecutive tool failures keep running (default config), observable and persisted
+✔ long: 60 consecutive tool failures keep running (legacy maxToolFailures=3), observable and persisted
+✔ model errors and unexpected child exits still fail after repeated tool failures
+ℹ tests 40
+ℹ pass 40
+ℹ fail 0
+VALIDATION_EXIT=0
+```
+
+`test/failure-name.test.mjs` 通过本机 Pi 的真实扩展加载器加载独立的 friends 工具，使用 `/tmp` 状态与一个真实 RPC 子进程发送模拟事件；不调用模型、不加载当前团队。short / long 各连续 5 次 read 失败，真实 list 返回字段节选如下（完整 content/details 与 checkDue 原文在上述日志中）：
+
+```json
+[
+  {"id":"6008c078-1b93-46f8-8eed-89cb6edab996","displayName":"🙂林","name":"褚二五","taskType":"short","status":"running","failures":5,"lastError":"","lastToolOutcome":{"at":1792177868295,"tool":"read","failureKind":"tool","error":"ENOENT simulated-5"}},
+  {"id":"344766ea-4153-4140-86c4-611e92cd35d9","displayName":"😀陈","name":"内部长活名","taskType":"long","status":"running","failures":5,"lastError":"","lastToolOutcome":{"at":1792177868344,"tool":"read","failureKind":"tool","error":"ENOENT simulated-5"}}
+]
+```
+
+已验证：默认/旧配置、long/short 共四组连续 60 次失败仍运行且状态持久化；成功后失败计数归零；模型错误和异常进程退出仍失败收尾；spawn/list/wait/send/stop/accept/reject/dismiss/quiet/model 所有成员返回包含显示名；默认文本与生产面板一致，完整名字仍可在详情查询；旧记录补齐显示名；checkDue/done 提醒与长活拒停使用显示名；原长活二次验证等已有测试均通过。测试中的成员完成/失败事件是模拟事件，不是模型实际交付。
+
+未验证：当前会话重载后是否获得新规则及实际运行时的 UI 表现、真实模型是否据失败记录合理决策；本轮未调用模型或重载当前会话。后续在无运行任务的安全时机加载更新后，应确认 spawn/list/提醒里的 displayName 与面板一致，并观察真实工具连续失败时任务仍继续。check 是 esbuild 编译检查，本项目没有静态类型检查配置。
+
+## 停伙伴前的二次验证（上轮）
+
+仅修改本插件目录；没有重启或重载正在使用的会话，没有接触微服。运行时保护位于 `Team.stop`，`friends stop` 与 `/f` 的停止操作共用：长活 `lastActivityMs < 180000` 默认拒绝，返回结构化证据并要求 `confirm=true`；显式确认仍须非空 reason。长活停止保存证据快照，短活直接停止。注入规则要求长活先 send 问询并等一轮，不能以 noProgressMs 代替工具活动证据。
+
+已在后台执行项目原有命令，日志为 `/tmp/pi-friends-stop-validation.log`：
+
+```text
+> npm run check
+PASS TypeScript compilation: 10 source files (esbuild); static type checking is not configured in this project
+> npm test
+ℹ tests 34
+ℹ pass 34
+ℹ fail 0
+VALIDATION_EXIT=0
+```
+
+新增 `test/stop.test.mjs` 的 7 项回归覆盖：31 秒前仍有活动且 159 秒没汇报时拒停并保留进程/消息/状态；超过 3 分钟无活动可停；179999/180000 毫秒边界；短活直接停；布尔确认与非空理由；未知活动记录的保护；真实扩展加载器加载隔离的 friends 工具并模拟 stop，同时验证上下文注入与 `/f` 取消/确认。
+
+模拟通过真实插件工具入口执行，但成员和 RPC 子进程是假数据，不调用真实模型。实际返回 `isError=true`、`code=LONG_TASK_STOP_VERIFICATION`、`requiresConfirmation=true`，证据包含 `lastActivityMs=31000`、`noProgressMs=159000`、`activity=read evidence.txt`、`lastToolOutcome.tool=read`，拒绝后成员仍为 running。显式确认并填写证据后返回 stopped，保存 `stopEvidence.confirmed=true`。
+
+验证边界：本项目仍没有静态类型检查配置，check 是 esbuild 编译检查。运行时强制活动门槛、显式确认和非空理由，不自动验证理由的真实性或 send/等待是否真的完成。主模型在真实长活中的规则遵循，以及当前会话在安全重载后获得新参数和保护，仍需后续观察；本轮未触碰当前会话。
+
+## 取消固定超时与面板重做（上轮）
+
+本轮修改限定在本插件目录。未重载当前会话、未调用真实模型、未修改本机个人配置或线上服务。测试使用 `/tmp` 隔离状态和产物。
+
+可复现命令：
+
+```bash
+npm run check
+npm test
+node test/reload-live.mjs
+npm run preview
+# 超过 25 秒的验证必须后台启动；退出码及日志异步读取：
+setsid bash -c 'node test/no-deadline.mjs > /tmp/pi-friends-61s.log 2>&1' >/dev/null 2>&1 &
+```
+
+已验证：
+
+- 10 个 TypeScript 源文件经 esbuild 编译通过，父/子插件由本机 Pi 扩展加载器实际加载通过。项目原来只有 `npm test`，没有静态类型检查配置；新增 `npm run check` 是编译检查，不应称为 `tsc` 类型检查。
+- 27 项自动化测试通过，覆盖 `killed=true,code=0` 必须失败、真实 SIGTERM、显式命令超时、abort、普通非零退出、两类计数分离、旧成员任务超时不再停止、检查提醒去重和主 Agent 主动停止。
+- 真正执行 worker 注册的 friend_exec，不传 timeout，运行 `printf before; sleep 61; printf after`；实测 61.2 秒，返回 `stdout=beforeafter, code=0, killed=false, success=true`。
+- 面板覆盖长短排序、四种名字颜色、颜色范围、时间格式与显示格对齐、标题与状态图标删除、已结束成员移除、600 种头像姓氏不重复；父插件通知覆盖完成/报错/主动停止，每个 revision 只弹一次，list 与再次加载不重复。
+- 原有 `node test/reload-live.mjs` 同进程更新、菜单遣散、工具验收和 widget 移除回归通过。
+- `npm run preview` 使用生产 `renderPanel` 生成带 ANSI 颜色的文本，留在 `/tmp/pi-friends-ui-preview.txt`。这是固定样例数据的真实渲染，不是当前用户会话的实况。
+
+策略细节：
+
+- 命令执行保留 `killed/timedOut/signal`，判定顺序为 timeout、killed/signal、普通非零退出。被杀却报告 code=0 时将 code 改为 null，并返回 success=false、isError=true。进程组取消与 SIGKILL 收尾避免遗留子进程；只在主 Agent 显式指定命令 timeout 时设置计时器。
+- 普通错误只累计 failures，阈值仍为 maxToolFailures=3；超时和被杀分别累计 interruptions.timeout/killed，不增加也不重置普通错误次数。
+- 旧 timeoutMs/progressMs/stallMs 参数保留解析兼容，不再自动结束成员或催报。spawn 必须由主 Agent 指定 long/short；长活在第 2、4 分钟检查，第 5 分钟后进入五分钟刻度，随后第 10、15…分钟检查；短活每分钟检查。只提醒大哥查看，不自动停止子代理。list/wait 确认检查并给出新的下一次检查时间。
+- 时间规格同时给了“超过 99 分才用小时”和示例 `1时02`（62 分钟），两者无法同时作为 elapsed 输出。实现遵守明确阈值：62 分显示 `62分`、100 分显示 `1时40`；小时格式函数单测覆盖 `1时02`。新任务首个不足 5 秒的区间显示 `05秒`，避免出现规格未列出的 `00秒`。
+
+仍需真机观察：用户终端中深浅绿色的观感、emoji 字体实际占宽，以及主模型在真实长任务里是否按隐藏提醒逐次检查并主动汇报。提醒和调度已经确定性测试；本轮没有等待真实模型运行 10 分钟以上，也没有重载正在使用的会话。
+
+以下为历史版本验收记录，旧超时/面板策略不代表当前实现。
+
 ## 人名、对话降噪与收尾顺序（2026-09-07）
 
 确认编号名来自同一团队 44 条历史记录长期占用候选池，并非模型遗忘。离队名现可复用，当前成员按人名优先解析；内置候选用尽后生成普通人名，不再退回“伙伴N”。所有自动状态消息改为 display=false 的紧凑隐藏上下文，工具结果取消 Markdown 表格；friends 工具用无边框单行渲染，成功后不铺结果块，错误显示一行。状态观察留在常驻面板。主 Agent 的收尾规则通过系统提示和每次模型调用的非持久上下文同时注入，spawn 后同一轮也覆盖：默认先等待、检查、验收和离队，再作一次合并总结；用户明确要求后台继续时除外。10 项自动化测试和同进程加载测试通过，未调用真实模型。

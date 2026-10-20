@@ -1,4 +1,4 @@
-import fs from 'node:fs';
+import { runCommand } from './command.ts';
 import { Type } from 'typebox';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { FileLedger, FileGuard, canonical, fingerprint, readJSON } from './store.ts';
@@ -26,15 +26,15 @@ export default function(pi: ExtensionAPI) {
   pi.registerTool({name:'friend_files',label:'协作文件',description:'查看谁正在占用或最近修改了哪些文件。',parameters:Type.Object({}),
     async execute() { return result(ledger.list().map(({history,...row})=>row).slice(-80)); }
   });
-  pi.registerTool({name:'friend_exec',label:'任务命令',description:'执行任务所需的命令。必须声明所有预期写入的文件 writePaths；禁止借此绕过 edit/write 的版本检查。这是协作约定，不是沙箱。timeout 单位秒，默认 60，可为长命令指定更大值。',
+  pi.registerTool({name:'friend_exec',label:'任务命令',description:'执行任务所需的命令。必须声明所有预期写入的文件 writePaths；禁止借此绕过 edit/write 的版本检查。这是协作约定，不是沙箱。timeout 单位秒，由主 Agent 依任务长短指定；省略表示不限时。超时、被信号终止、非零退出分别报告失败。',
     parameters:Type.Object({command:Type.String(),writePaths:Type.Array(Type.String()),timeout:Type.Optional(Type.Number({minimum:1}))}),
     async execute(_id,p,signal,_update,ctx) {
       const files=[...new Set(p.writePaths.map(f=>canonical(f,ctx.cwd)))].sort(); const held=[];
       try {
         for(const file of files) { const release=ledger.claim(file,{id,name}); const before=fingerprint(file); held.push({file,release,before});
           if(before!==null&&guard.seen.get(file)!==before) throw new Error(`请先 read 最新文件：${file}`); }
-        const out=await pi.exec('bash',['-lc',p.command],{signal,timeout:(p.timeout||60)*1000});
-        return {...result({code:out.code,stdout:out.stdout.slice(-12000),stderr:out.stderr.slice(-4000)}),isError:out.code!==0};
+        const out=await runCommand(p.command,{cwd:ctx.cwd,signal,timeout:p.timeout});
+        return {...result(out),isError:!out.success};
       } finally { for(const h of held) { try { ledger.record(h.file,{id,name},h.before,'friend_exec'); guard.seen.set(h.file,fingerprint(h.file)); } finally { h.release(); } } }
     }
   });

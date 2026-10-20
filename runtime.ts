@@ -5,20 +5,36 @@ import { randomUUID, randomInt } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { atomicJSON, readJSON, rootDir, hash, FileLedger } from './store.ts';
 import { PiRPC } from './rpc.ts';
+import { allocateIdentity, nameSurnames, displayName } from './identity.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const active = s => ['queued','starting','running','retrying','blocked','stalled'].includes(s);
-export const statusLabels = { queued:'⏳', starting:'🚀', running:'⚙️', retrying:'🔄', blocked:'🙋', stalled:'⚠️', done:'📋', failed:'❌', stopped:'⏹️', interrupted:'⏸️', departed:'👋' };
+export const statusLabels = { queued:'排队', starting:'启动', running:'执行', retrying:'重试', blocked:'需要帮助', stalled:'进度待确认', done:'待验收', failed:'报错', stopped:'已停止', interrupted:'已中断', departed:'已离开' };
 export const clean = (text, max = 160) => String(text || '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').replace(/\s+/g, ' ').slice(0, max);
 const names = ['胡歌','周迅','一凡','刘亦菲','张译','黄渤','倪妮','吴彦祖','刘诗诗','陈坤','舒淇','彭于晏','章子怡','高圆圆','刘德华','梁朝伟','汤唯','邓超','孙俪','雷佳音','马伊琍','秦昊','海清','姚晨','佟丽娅','段奕宏','郝蕾','袁泉','陈道明','宋佳','王凯','白宇','朱一龙','张子枫','咏梅','陶虹','梅婷','于和伟','王志文','俞飞鸿'];
-const nameSurnames=['林','陈','周','苏','沈','顾','陆','许','程','孟','叶','江','宋','唐','夏','乔','温','徐','韩','谢'];
 const nameCharacters=['安','宁','清','言','川','舟','禾','然','悦','遥','越','晴','晖','卓','岚','知','远','嘉','景','初'];
 const generatedNames=nameSurnames.flatMap(s=>nameCharacters.flatMap(a=>nameCharacters.map(b=>s+a+b)));
 export const textOf = m => typeof m?.content === 'string' ? m.content : (m?.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
 
+export const checkInterval = (a, now = Date.now()) => a.taskType === 'long' ? (now - (a.startedAt || a.createdAt) < 300000 ? 120000 : 300000) : 60000;
+export function nextCheckAt(a, now = Date.now()) {
+  const start = a.startedAt || a.createdAt, elapsed = Math.max(0, now - start);
+  if (a.taskType !== 'long') return start + (Math.floor(elapsed / 60000) + 1) * 60000;
+  return start + (elapsed < 240000 ? (Math.floor(elapsed / 120000) + 1) * 120000 : Math.max(600000, (Math.floor(elapsed / 300000) + 1) * 300000));
+}
+
+export const LONG_STOP_ACTIVITY_MS = 180000;
+export class StopVerificationError extends Error {
+  details;
+  constructor(message, evidence, requiresConfirmation = false) {
+    super(message); this.name = 'StopVerificationError';
+    this.details = { code:'LONG_TASK_STOP_VERIFICATION', requiresConfirmation, evidence };
+  }
+}
+
 export class Team extends EventEmitter {
-  constructor({ key, cwd, dir = rootDir(), maxConcurrent = 4, maxTasks = 16, maxToolFailures = 3, namePool = names, skills = false, progressMs = 60000, stallMs = 180000, timeoutMs = 1800000, fallback, rpcFactory, extraArgs = [] }) {
-    for(const [label,value,min] of [['maxConcurrent',maxConcurrent,1],['maxTasks',maxTasks,0],['maxToolFailures',maxToolFailures,0],['progressMs',progressMs,1],['stallMs',stallMs,0],['timeoutMs',timeoutMs,0]])
+  constructor({ key, cwd, dir = rootDir(), maxConcurrent = 4, maxTasks = 16, namePool = names, skills = false, progressMs = 60000, stallMs = 180000, timeoutMs = 0, fallback, rpcFactory, extraArgs = [] }) {
+    for(const [label,value,min] of [['maxConcurrent',maxConcurrent,1],['maxTasks',maxTasks,0],['progressMs',progressMs,1],['stallMs',stallMs,0],['timeoutMs',timeoutMs,0]])
       if(!Number.isSafeInteger(value)||value<min)throw new Error(`${label} 必须是 >= ${min} 的整数`);
     if(!Array.isArray(namePool)||namePool.some(n=>typeof n!=='string'||!clean(n,16)))throw new Error('namePool 必须是人名数组');
     if(typeof skills!=='boolean')throw new Error('skills 必须是布尔值');
@@ -26,7 +42,7 @@ export class Team extends EventEmitter {
     this.fileDir = path.join(dir, 'files'); this.ledger = new FileLedger(this.fileDir);
     this.releaseOwner = new FileLedger(path.join(dir,'owners')).claim(this.stateFile,{name:'Pi Friends 主会话'});
     this.maxConcurrent = maxConcurrent; this.progressMs = progressMs; this.stallMs = stallMs; this.timeoutMs = timeoutMs;
-    this.maxTasks=maxTasks;this.maxToolFailures=maxToolFailures;this.namePool=namePool.map(n=>clean(n,16));this.skills=skills;
+    this.maxTasks=maxTasks;this.namePool=namePool.map(n=>clean(n,16));this.skills=skills;
     this.rpcFactory = rpcFactory || ((args, options) => new PiRPC(args, options)); this.extraArgs = extraArgs; this.fallback=fallback;
     this.clients = new Map(); this.closed = false;
     this.agents = readJSON(this.stateFile, { agents: [] }).agents;
@@ -36,24 +52,30 @@ export class Team extends EventEmitter {
       if(process.platform==='linux'&&a.pid>0){try{const env=fs.readFileSync(`/proc/${a.pid}/environ`,'utf8').split('\0');if(env.includes(`PI_FRIENDS_AGENT_ID=${a.id}`))process.kill(-a.pid,'SIGKILL');}catch{}}
       a.status = 'interrupted'; a.summary = '上次运行已中断，可继续此会话';
     }
-    this.save(); this.timer = setInterval(() => this.tick(), 1000); this.timer.unref();
+    for (const a of this.agents) {
+      if (!a.avatar || !a.surname) Object.assign(a, allocateIdentity(this.agents.filter(other => other !== a)));
+      a.displayName = displayName(a);
+      a.taskType ||= 'short'; a.interruptions ||= { timeout: 0, killed: 0 };
+    }
+    this.save(); this.timer = setInterval(() => this.tick(), 5000); this.timer.unref();
   }
   save() { atomicJSON(this.stateFile, { version: 1, implementation: 'pi-friends', agents: this.agents }); }
   changed(a) { this.save(); this.emit('change', a); }
   resolve(id) {
     const exact=this.agents.filter(a=>a.id===id);if(exact.length===1)return exact[0];
     const ids=this.agents.filter(a=>a.id.startsWith(id));if(ids.length===1)return ids[0];
-    const names=this.agents.filter(a=>a.name===id),present=names.filter(a=>a.status!=='departed');
+    const names=this.agents.filter(a=>a.name===id||displayName(a)===id),present=names.filter(a=>a.status!=='departed');
     if(present.length===1)return present[0];if(!present.length&&names.length===1)return names[0];
     throw new Error('请提供唯一的人名或 ID');
   }
-  spawn({ task, name, provider, model, thinking, timeoutMs = this.timeoutMs, context = '', quiet = false }) {
+  spawn({ task, name, provider, model, thinking, timeoutMs = this.timeoutMs, taskType = 'short', context = '', quiet = false }) {
     if (this.closed) throw new Error('Team is closed');
     if (!provider || !model) throw new Error('必须提供 provider 和 model');
     if (!task?.trim()) throw new Error('任务不能为空');
+    if (!['long','short'].includes(taskType)) throw new Error('taskType 必须是 long（长活）或 short（短活）');
     if(!Number.isSafeInteger(timeoutMs)||timeoutMs<0)throw new Error('timeoutMs 必须是非负整数；0 表示不限时');
     if (this.maxTasks && this.agents.filter(a => active(a.status)&&!a.finishedAt).length >= this.maxTasks) throw new Error(`最多保留 ${this.maxTasks} 个待运行任务，请等待已有成员完成`);
-    // Departed people no longer occupy a display name. UUIDs keep history unambiguous.
+    // Departed people no longer occupy a full name. UUIDs keep history unambiguous.
     const used = new Set(this.agents.filter(a=>a.status!=='departed').map(a => a.name));
     if(name!==undefined){name=clean(name,16);if(!name)throw new Error('人名不能为空');}
     if (name && used.has(name)) throw new Error('人名已存在，请换一个名字或继续给原成员派活');
@@ -61,9 +83,11 @@ export class Team extends EventEmitter {
     const generated=generatedNames.filter(n=>!used.has(n));
     if(!name&&choices.length===0&&generated.length===0)throw new Error('当前团队没有可用人名，请在 namePool 增加候选名');
     const id = randomUUID();
-    const a = { id, name: name || (choices.length ? choices[randomInt(choices.length)] : generated[randomInt(generated.length)]), task, context, timeoutMs,
+    const a = { id, ...allocateIdentity(this.agents), taskType, name: name || (choices.length ? choices[randomInt(choices.length)] : generated[randomInt(generated.length)]), task, context, timeoutMs,
       provider, model, thinking, quiet, status: 'queued', summary: '等待空闲位置', createdAt: Date.now(), updatedAt: Date.now(), lastActivity: Date.now(), lastProgress: Date.now(),
-      lastNotice: Date.now(), messages: [], results: [], usage: { input:0, output:0, cost:0 }, failures: 0, revision: 0, notifiedRevision: 0 };
+      lastNotice: Date.now(), messages: [], results: [], usage: { input:0, output:0, cost:0 }, failures: 0, interruptions: { timeout:0, killed:0 }, revision: 0, notifiedRevision: 0 };
+    a.displayName = displayName(a);
+    a.nextCheckAt = nextCheckAt(a); a.checkNotifiedAt = 0;
     this.agents.push(a); this.changed(a); this.pump(); return a;
   }
   pump() {
@@ -78,7 +102,8 @@ export class Team extends EventEmitter {
     delete a.settling;
     delete a.finishedAt;
     a.generation=(a.generation||0)+1;
-    a.status = 'starting'; a.summary = '正在连接模型'; a.startedAt = Date.now(); a.lastActivity = Date.now(); a.lastProgress = Date.now(); a.failures = 0; a.lastError = ''; a.lastAnswer = '';
+    a.status = 'starting'; a.summary = '正在连接模型'; a.startedAt = Date.now(); a.lastActivity = Date.now(); a.lastProgress = Date.now(); a.failures = 0; a.interruptions = { timeout:0, killed:0 }; a.lastError = ''; a.lastAnswer = '';
+    a.nextCheckAt = nextCheckAt(a); a.checkNotifiedAt = 0; delete a.activity; delete a.toolStartedAt;
     const runDir = path.join(this.dir, a.id); fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
     const args = ['--mode','rpc','--no-extensions','-e',path.join(here,'worker.ts'),'--no-prompt-templates',
       '--provider',a.provider,'--model',a.model,'--name',a.name,'--session-dir',runDir,
@@ -115,7 +140,7 @@ export class Team extends EventEmitter {
     this.changed(a);
   }
   instructions(a) {
-    return `你是独立 Pi 子代理，内部 ID ${a.id}，插件已为你分配显示人名 ${a.name}。人名不代表能力或职业，不依赖你记住或主动命名。首次行动用 friend_report 报告一句话计划；可以保留当前名字，也可自选未占用的简短人名。后续任务保留身份。\n` +
+    return `你是独立 Pi 子代理，内部 ID ${a.id}，插件已为你分配面板显示名 ${displayName(a)}，内部完整昵称 ${a.name}（friend_report 的 name）。人名不代表能力或职业，不依赖你记住或主动命名。首次行动用 friend_report 报告一句话计划；可以保留当前名字，也可自选未占用的简短人名。后续任务保留身份。\n` +
       `只处理主代理委派的任务。默认通过 read/edit/write 修改文件；这些工具共享文件占用和版本检查。先 read 再 edit/write，冲突时重新读取或先处理别的文件。不要通过 shell 绕过冲突检查。friend_exec 用于任务所需的命令，任何预计写入的文件必须在 writePaths 声明；它不是安全沙箱。\n` +
       `每个阶段变化主动用 friend_report 给一句具体进度；需要帮助时 state=blocked。不要把“工具还在运行”当成已取得进展。收到主代理消息立即遵循；收到“请更新进度”时调用报告工具，不要仅聊天。\n` +
       `不要无限重试同一个失败操作。任务结束说明：改动文件、完成内容、验证结果、未解决项；完成是交回待主代理验收。不得自行派子代理。任务通知由主代理统一处理，不自行发送设备通知。主代理上下文不会自动全文复制，必要时请求补充。`;
@@ -140,9 +165,16 @@ export class Team extends EventEmitter {
     }
     if (e.type === 'tool_execution_start') {
       a.activity = `${e.toolName} ${clean(e.args?.path || e.args?.command || '',80)}`;
+      a.toolStartedAt = Date.now(); a.toolCallId = e.toolCallId;
       this.emit('change', a);
     }
     if (e.type === 'tool_execution_end') {
+      if (a.toolCallId === e.toolCallId) { delete a.toolStartedAt; delete a.activity; delete a.toolCallId; }
+      const details = e.result?.details;
+      const interruption = e.toolName === 'friend_exec' && (details?.failureKind === 'timeout' || details?.timedOut) ? 'timeout' :
+        e.toolName === 'friend_exec' && (details?.failureKind === 'killed' || details?.killed || details?.signal) ? 'killed' : null;
+      // Respect termination metadata even if an older tool wrapper reports isError=false.
+      const toolFailed = !!(e.isError || interruption || (e.toolName === 'friend_exec' && details?.success === false));
       if (e.toolName === 'friend_report' && !e.isError) {
         const report = e.result?.details;
         if (report?.summary) {
@@ -155,8 +187,10 @@ export class Team extends EventEmitter {
           if (a.status === 'blocked') this.notify(a, 'blocked');
         }
       }
-      if (e.isError) a.failures++; else a.failures = 0;
-      if (this.maxToolFailures && a.failures >= this.maxToolFailures) { this.fail(a, new Error(`连续 ${this.maxToolFailures} 次工具失败，已停止重试，等待主代理处理`)); return; }
+      if (interruption) { a.interruptions ||= { timeout:0, killed:0 }; a.interruptions[interruption]++; }
+      else if (toolFailed) a.failures++; else a.failures = 0;
+      a.lastToolOutcome = { at:Date.now(), tool:e.toolName, failureKind:interruption || (toolFailed ? 'tool' : null), error:details?.error };
+      // Tool errors are observations for the parent, never an automatic stop condition.
       this.changed(a);
     }
     if (e.type === 'message_end' && e.message?.role === 'assistant') {
@@ -179,9 +213,9 @@ export class Team extends EventEmitter {
       // A new follow-up can arrive between agent_settled and the state response.
       if(state?.isStreaming||state?.pendingMessageCount)return;
       const needsHelp=a.status==='blocked';
-      a.status=needsHelp?'blocked':'done';a.summary=clean((a.lastAnswer||a.summary||'任务已结束，请主代理验收').split('\n').find(line=>line.trim())?.replace(/[`*#]/g,''));a.finishedAt=Date.now();a.revision++;
+      a.status=needsHelp?'failed':'done';a.summary=clean((a.lastAnswer||a.summary||'任务已结束，请主代理验收').split('\n').find(line=>line.trim())?.replace(/[`*#]/g,''));a.finishedAt=Date.now();a.revision++;
       a.results.push({at:a.finishedAt,text:a.lastAnswer||a.summary});a.results=a.results.slice(-10);
-      this.clients.delete(a.id);rpc.kill();this.changed(a);this.notify(a,needsHelp?'blocked':'done');this.pump();
+      this.clients.delete(a.id);rpc.kill();this.changed(a);this.notify(a,needsHelp?'failed':'done');this.pump();
     } finally {delete a.settling;this.save();}
   }
   notify(a, reason) { a.updatedAt = Date.now(); a.lastNotice = Date.now(); this.emit('notice', { agent:a, reason }); this.save(); }
@@ -221,9 +255,19 @@ export class Team extends EventEmitter {
     } catch(e) { m.status = 'rejected'; m.error = clean(e.message); this.changed(a); throw e; }
     this.changed(a); return m;
   }
-  stop(id) {
+  stop(id, reason, confirm = false) {
     const a = this.resolve(id); if (!active(a.status)) return a;
-    a.status = 'stopped'; a.summary = '主代理已停止任务，修改文件保留'; a.revision++;
+    const evidence = { id:a.id, displayName:displayName(a), name:a.name, taskType:a.taskType, status:a.status, observedAt:Date.now(),
+      ...this.inspect(a), activity:a.activity || null, lastToolOutcome:a.lastToolOutcome || null,
+      interruptions:{...a.interruptions}, failures:a.failures };
+    if (a.taskType === 'long') {
+      if (evidence.lastActivityMs < LONG_STOP_ACTIVITY_MS && confirm !== true)
+        throw new StopVerificationError(`拒绝停止长活 ${displayName(a)}：lastActivityMs=${evidence.lastActivityMs}（${Math.floor(evidence.lastActivityMs/1000)} 秒前仍有活动），当前工具=${evidence.activity || '无'}，最近工具=${evidence.lastToolOutcome?.tool || '无记录'}，noProgressMs=${evidence.noProgressMs} 不能作为卡死依据。先 friends send 询问状态并等至少一轮；只有确信跑偏、重复或工具长时间无响应，才可带 confirm=true 和含证据的 reason 明确确认。`, evidence, true);
+      if (!reason?.trim())
+        throw new StopVerificationError('停止长活必须填写 reason，说明询问状态并等待一轮后的结论，以及 lastActivityMs、toolElapsedMs、lastToolOutcome 或重复/跑偏的具体证据。', evidence);
+      a.stopEvidence = { ...evidence, confirmed:confirm === true };
+    }
+    a.status = 'stopped'; a.stopReason = clean(reason === undefined ? '主代理决定停止任务' : reason, a.taskType === 'long' ? 2000 : 160); a.summary = clean(a.stopReason); a.revision++;
     a.finishedAt=Date.now();
     a.generation=(a.generation||0)+1;
     for (const m of a.messages) if (m.status === 'pending' || m.status === 'delivered') m.status = 'cancelled';
@@ -251,28 +295,37 @@ export class Team extends EventEmitter {
     const now = Date.now();
     for (const a of this.agents) {
       if (!this.clients.has(a.id)) continue;
-      const timeout=a.timeoutMs??this.timeoutMs;
-      if (timeout && now - a.startedAt >= timeout) { this.fail(a,new Error('达到单次任务时间上限，已停止；可检查后继续')); continue; }
-      if (this.stallMs && now - a.lastProgress >= this.stallMs && a.status !== 'stalled' && a.status !== 'blocked' && a.status !== 'retrying') {
-        a.status = 'stalled'; a.summary = `${a.summary}（长时间没有阶段进展）`; this.changed(a); this.notify(a,'stalled');
-      }
-      if (!a.quiet && now - a.lastNotice >= this.progressMs) {
-        this.notify(a,'progress');
-        // One outstanding request, not an ever-growing queue of timer messages.
-        if (!a.lastProgressRequest && a.status === 'running') {
-          a.lastProgressRequest = now;
-          this.clients.get(a.id)?.call('prompt',{ message:'[进度检查] 请在当前工具结束后的安全时机用 friend_report 更新一句具体进度；随后继续任务。', streamingBehavior:'steer' }).catch(() => {});
-        }
+      // Legacy timeoutMs/progressMs/stallMs are read for compatibility only.
+      // Deadlines never end a task; the parent observes and decides whether to stop.
+      a.nextCheckAt ||= nextCheckAt(a);
+      if (now >= a.nextCheckAt && a.checkNotifiedAt !== a.nextCheckAt) {
+        a.checkNotifiedAt = a.nextCheckAt;
+        this.notify(a, 'checkDue');
       }
     }
     this.emit('tick');
   }
-  list(includeDeparted = false) { return this.agents.filter(a=>includeDeparted||a.status!=='departed').map(a => ({ ...a, implementation:'pi-friends', files:this.ledger.list().filter(f => f.id === a.id).map(({ history,...f })=>f) })); }
+  inspect(a, now = Date.now()) {
+    const elapsedMs = Math.max(0, (a.finishedAt || now) - (a.startedAt || a.createdAt || now));
+    const noProgressMs = Math.max(0, now - (a.lastProgress || a.startedAt || now));
+    return { elapsedMs, noProgressMs, lastActivityMs:Math.max(0, now - (a.lastActivity || now)), toolElapsedMs:a.toolStartedAt ? now-a.toolStartedAt : 0,
+      checkIntervalMs:checkInterval(a,now), nextCheckAt:a.nextCheckAt, checkDue:active(a.status)&&!a.finishedAt&&now >= a.nextCheckAt,
+      reportToUser:a.taskType==='long', anomalies:[...(a.status==='blocked'?['子代理需要帮助']:[]),...(a.status==='retrying'?['模型正在重试']:[]),
+        ...(noProgressMs >= checkInterval(a,now)*2 ? ['长时间无阶段汇报，请结合当前工具判断'] : []),
+        ...((a.interruptions?.timeout||a.interruptions?.killed)?['命令有超时或被杀记录，请主 Agent 检查']:[]) ] };
+  }
+  acknowledgeChecks(agents, now = Date.now()) {
+    for (const row of agents) { const a=this.resolve(row.id); if (!active(a.status)||a.finishedAt) continue;
+      a.lastCheckedAt=now; a.nextCheckAt=nextCheckAt(a,now); a.checkNotifiedAt=0;
+    }
+    this.save();
+  }
+  list(includeDeparted = false) { return this.agents.filter(a=>includeDeparted||a.status!=='departed').map(a => ({ ...a, ...this.inspect(a), implementation:'pi-friends', files:this.ledger.list().filter(f => f.id === a.id).map(({ history,...f })=>f) })); }
   async wait(seconds = 20, signal) {
     if (this.agents.every(a => !active(a.status)||(a.status==='blocked'&&!this.clients.has(a.id))) || signal?.aborted) return this.list();
     await new Promise(resolve => {
       const done = () => { clearTimeout(timer); this.off('notice', notice); signal?.removeEventListener('abort',done); resolve(); };
-      const notice = ({ reason }) => { if (['done','failed','blocked','stopped','departed'].includes(reason)) done(); };
+      const notice = ({ reason }) => { if (['done','failed','blocked','stopped','departed','checkDue'].includes(reason)) done(); };
       const timer = setTimeout(done, Math.min(Math.max(seconds,1),30)*1000); this.on('notice',notice); signal?.addEventListener('abort',done,{once:true});
     });
     return this.list();

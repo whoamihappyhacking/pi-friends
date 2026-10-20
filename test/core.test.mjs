@@ -18,6 +18,7 @@ test('陈旧通知不恢复已离队成员且 stalled 不主动触发幽灵轮�
   assert.equal(noticeTriggersTurn('modelChanged'),false);
   assert.equal(noticeTriggersTurn('done'),true);
   assert.equal(noticeTriggersTurn('failed'),true);
+  assert.equal(noticeTriggersTurn('checkDue'),true);
 });
 
 test('模型参数优先于配置，未配置继承主会话，无厂商分支且不覆盖显式档位',()=>{
@@ -99,7 +100,7 @@ test('运行策略可配置，长任务不限时，不暗中限制并发或禁�
     assert.equal(t.agents[0].lastAnswer,full);
     for(let i=0;i<101;i++)await t.message(t.agents[0].id,`要求 ${i}`,'steer');
     assert.equal(t.agents[0].messages.length,101);
-    const limited=t.spawn({task:'limited',provider:'test',model:'test'});t.stop(t.agents[1].id);await pause();limited.startedAt=0;t.tick();assert.equal(limited.status,'failed');
+    const limited=t.spawn({task:'limited',provider:'test',model:'test'});t.stop(t.agents[1].id);await pause();limited.startedAt=1;t.tick();assert.equal(limited.status,'running');
   }finally{t.close();fs.rmSync(d,{recursive:true});}
   assert.throws(()=>new Team({key:'invalid',maxConcurrent:0}),/maxConcurrent/);
 });
@@ -116,12 +117,13 @@ test('并发排队、逐成员模型、身份稳定、消息已读、继续和�
   t.stop(b.id);await pause();assert.equal(a.status,'running');assert.match(clients[2].calls.find(c=>c.type==='prompt').message,/继续第二项/);
   t.close();const restored=new Team({key:'test',cwd:d,dir:d,rpcFactory:factory});assert.equal(restored.resolve(a.id).status,'interrupted');assert.equal(restored.resolve(a.id).name,oldName);restored.close();fs.rmSync(d,{recursive:true});
 });
-test('静默模式不催进度，普通模式不堆积催报消息，连续失败会停止',async()=>{
+test('检查提醒只交给主 Agent，不向子代理堆积催报消息，连续普通失败只记录不停机',async()=>{
   const d=temp(),clients=[];const t=new Team({key:'test',cwd:d,dir:d,progressMs:100,rpcFactory:()=>{const f=new Fake();clients.push(f);return f;}});
   const a=t.spawn({task:'normal',provider:'test',model:'test'}),b=t.spawn({task:'quiet',quiet:true,provider:'test',model:'test'});await pause();
-  a.lastNotice=0;b.lastNotice=0;t.tick();await pause();a.lastNotice=0;t.tick();
-  assert.equal(clients[0].calls.filter(c=>c.message?.includes('进度检查')).length,1);assert.equal(clients[1].calls.filter(c=>c.message?.includes('进度检查')).length,0);
-  for(let i=0;i<3;i++)clients[0].emit('event',{type:'tool_execution_end',toolName:'edit',isError:true});assert.equal(a.status,'failed');assert.equal(clients[0].killed,true);
+  const notices=[];t.on('notice',e=>notices.push(e));a.nextCheckAt=1;b.nextCheckAt=1;t.tick();t.tick();
+  assert.equal(notices.filter(e=>e.reason==='checkDue').length,2);
+  assert.equal(clients[0].calls.filter(c=>c.message?.includes('进度检查')).length,0);assert.equal(clients[1].calls.filter(c=>c.message?.includes('进度检查')).length,0);
+  for(let i=0;i<5;i++)clients[0].emit('event',{type:'tool_execution_end',toolName:'edit',isError:true});assert.equal(a.failures,5);assert.equal(a.status,'running');assert.notEqual(clients[0].killed,true);
   t.close();fs.rmSync(d,{recursive:true});
 });
 test('同一个父会话禁止重复接管，关闭后可恢复',()=>{
